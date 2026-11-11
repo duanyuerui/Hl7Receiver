@@ -1,0 +1,18 @@
+## .NET 生成目录
+bin/
+obj/
+
+## 运行时产物
+ReceivedMessages/
+Logs/
+crash.log
+settings.json
+
+## IDE
+.vs/
+*.user
+*.suo
+
+## 系统文件
+Thumbs.db
+desktop.ini
