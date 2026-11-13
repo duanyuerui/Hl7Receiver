@@ -2,6 +2,9 @@
 bin/
 obj/
 
+## 单文件发布输出
+publish/
+
 ## 运行时产物
 ReceivedMessages/
 Logs/
