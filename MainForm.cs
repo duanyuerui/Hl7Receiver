@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Ports;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -24,9 +25,22 @@ public sealed class MainForm : Form
         "OBX|2|NM|5|ALT|98.2| umol/L |-|N|||F||98.2|20120405194403|||0|\r" +
         "OBX|3|NM|6|AST|26.4| umol/L |-|N|||F||26.4|||||\r";
 
+    private const int ModeSerial = 2;
+
     private readonly ComboBox _cboMode = new();
     private readonly TextBox _txtIp = new();
     private readonly NumericUpDown _numPort = new();
+    private readonly ComboBox _cboSerialPort = new();
+    private readonly Button _btnRefreshPorts = new();
+    private readonly ComboBox _cboBaud = new();
+    private readonly ComboBox _cboDataBits = new();
+    private readonly ComboBox _cboParity = new();
+    private readonly ComboBox _cboStopBits = new();
+    private readonly ComboBox _cboHandshake = new();
+    private readonly CheckBox _chkDtr = new();
+    private readonly CheckBox _chkRts = new();
+    private readonly FlowLayoutPanel _netPanel = new();
+    private readonly FlowLayoutPanel _serialPanel = new();
     private readonly ComboBox _cboEncoding = new();
     private readonly ComboBox _cboAckCode = new();
     private readonly CheckBox _chkAutoAck = new();
@@ -75,7 +89,7 @@ public sealed class MainForm : Form
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
-        Text = "HL7 网口接收测试工具（MLLP / TCP）";
+        Text = "HL7 接收测试工具（MLLP / TCP / 串口）";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1180, 720);
         Size = new Size(1420, 880);
@@ -84,10 +98,11 @@ public sealed class MainForm : Form
         BuildUi();
         LoadSettings();
         UpdateLocalIps();
-        AppendLog("HL7 网口接收测试工具已就绪。");
+        AppendLog("HL7 接收测试工具已就绪（网口 / 串口）。");
         AppendLog("MLLP 帧格式: 0x0B(起始) + HL7 报文 + 0x1C 0x0D(结束)。");
-        AppendLog("仪器主动把结果推给 LIS → 选“服务端监听”；仪器作为服务端 → 选“客户端连接”。");
-        AppendLog("TCP 一次读取不保证是一条完整报文，本工具会累积到 0x1C 0x0D 才判定完整。");
+        AppendLog("仪器主动把结果推给 LIS → 选“服务端监听”；仪器作为服务端 → 选“客户端连接”；仪器走 RS-232 串口 → 选“串口接收”。");
+        AppendLog("TCP/串口一次读取都不保证是一条完整报文，本工具会累积到 0x1C 0x0D 才判定完整。");
+        AppendLog("串口默认 9600,8,N,1，无流控；仪器要求 RTS/CTS 时按仪器说明调整。");
 
         _uiTimer.Interval = 400;
         _uiTimer.Tick += UiTimer_Tick;
@@ -134,12 +149,14 @@ public sealed class MainForm : Form
         };
 
         _cboMode.DropDownStyle = ComboBoxStyle.DropDownList;
-        _cboMode.Width = 230;
+        _cboMode.Width = 210;
         _cboMode.Items.AddRange(new object[]
         {
             "服务端监听（仪器来连我）",
-            "客户端连接（我连仪器）"
+            "客户端连接（我连仪器）",
+            "串口接收（打开 COM 口）"
         });
+        _cboMode.SelectedIndexChanged += (_, _) => UpdateModeUi();
 
         _txtIp.Width = 130;
         _txtIp.Text = "192.168.26.111";
@@ -153,9 +170,19 @@ public sealed class MainForm : Form
         _cboEncoding.Width = 170;
         foreach (var option in EncodingOptions) _cboEncoding.Items.Add(option.Label);
 
+        _netPanel.AutoSize = true;
+        _netPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        _netPanel.WrapContents = false;
+        _netPanel.Padding = new Padding(0);
+        _netPanel.Margin = new Padding(10, 0, 0, 0);
+        AddRowControl(_netPanel, "IP", _txtIp);
+        AddRowControl(_netPanel, "端口", _numPort);
+
+        BuildSerialPanel();
+
         AddRowControl(row1, "模式", _cboMode);
-        AddRowControl(row1, "IP", _txtIp);
-        AddRowControl(row1, "端口", _numPort);
+        row1.Controls.Add(_netPanel);
+        row1.Controls.Add(_serialPanel);
         AddRowControl(row1, "编码", _cboEncoding);
 
         StyleButton(_btnStart, "开始接收", 100);
@@ -341,7 +368,7 @@ public sealed class MainForm : Form
         tabs.TabPages.Add(CreateTextTab("十六进制", _rtbHex));
         tabs.TabPages.Add(CreateTreeTab("字段解析", _tvFields));
         tabs.TabPages.Add(CreateGridTab("检验结果", _gridResults));
-        tabs.TabPages.Add(CreateTextTab("网络日志", _rtbLog));
+        tabs.TabPages.Add(CreateTextTab("收发日志", _rtbLog));
         split.Panel2.Controls.Add(tabs);
 
         root.Controls.Add(split, 0, 1);
@@ -371,6 +398,173 @@ public sealed class MainForm : Form
             if (_service != null) _service.Lenient = _chkLenient.Checked;
         };
         _cboAckCode.SelectedIndexChanged += (_, _) => _ackCode = _cboAckCode.Text;
+    }
+
+    private void BuildSerialPanel()
+    {
+        _serialPanel.AutoSize = true;
+        _serialPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        _serialPanel.WrapContents = false;
+        _serialPanel.Padding = new Padding(0);
+        _serialPanel.Margin = new Padding(10, 0, 0, 0);
+        _serialPanel.Visible = false;
+
+        _cboSerialPort.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cboSerialPort.Width = 90;
+
+        _btnRefreshPorts.Text = "刷新";
+        _btnRefreshPorts.Width = 52;
+        _btnRefreshPorts.Height = 26;
+        _btnRefreshPorts.Margin = new Padding(4, 7, 0, 0);
+        _btnRefreshPorts.Click += (_, _) =>
+        {
+            RefreshSerialPorts();
+            UpdateModeUi();
+        };
+
+        var lblPort = new Label { Text = "串口", AutoSize = true, Margin = new Padding(0, 10, 4, 0) };
+        _serialPanel.Controls.Add(lblPort);
+        _serialPanel.Controls.Add(_cboSerialPort);
+        _serialPanel.Controls.Add(_btnRefreshPorts);
+
+        _cboBaud.DropDownStyle = ComboBoxStyle.DropDown;
+        _cboBaud.Width = 80;
+        _cboBaud.Items.AddRange(new object[] { "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200", "230400" });
+        _cboBaud.Text = "9600";
+        AddRowControl(_serialPanel, "波特率", _cboBaud);
+
+        _cboDataBits.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cboDataBits.Width = 50;
+        _cboDataBits.Items.AddRange(new object[] { 5, 6, 7, 8 });
+        _cboDataBits.SelectedIndex = 3;
+        AddRowControl(_serialPanel, "数据位", _cboDataBits);
+
+        _cboParity.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cboParity.Width = 90;
+        _cboParity.Items.AddRange(new object[] { "无 (None)", "奇 (Odd)", "偶 (Even)", "标记 (Mark)", "空格 (Space)" });
+        _cboParity.SelectedIndex = 0;
+        AddRowControl(_serialPanel, "校验", _cboParity);
+
+        _cboStopBits.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cboStopBits.Width = 60;
+        _cboStopBits.Items.AddRange(new object[] { "1", "1.5", "2" });
+        _cboStopBits.SelectedIndex = 0;
+        AddRowControl(_serialPanel, "停止位", _cboStopBits);
+
+        _cboHandshake.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cboHandshake.Width = 140;
+        _cboHandshake.Items.AddRange(new object[] { "无", "XON/XOFF", "RTS/CTS", "RTS/CTS+XON/XOFF" });
+        _cboHandshake.SelectedIndex = 0;
+        AddRowControl(_serialPanel, "流控", _cboHandshake);
+
+        _chkDtr.Text = "DTR";
+        _chkDtr.Checked = true;
+        _chkDtr.AutoSize = true;
+        _chkDtr.Margin = new Padding(10, 9, 4, 0);
+        _serialPanel.Controls.Add(_chkDtr);
+
+        _chkRts.Text = "RTS";
+        _chkRts.Checked = true;
+        _chkRts.AutoSize = true;
+        _chkRts.Margin = new Padding(0, 9, 0, 0);
+        _serialPanel.Controls.Add(_chkRts);
+    }
+
+    private bool IsSerialMode => _cboMode.SelectedIndex == ModeSerial;
+
+    /// <summary>按当前模式显示网口/串口参数，运行时锁定。</summary>
+    private void UpdateModeUi()
+    {
+        bool serial = IsSerialMode;
+        bool idle = !_running;
+
+        _netPanel.Visible = !serial;
+        _serialPanel.Visible = serial;
+        _lblLocalIp.Visible = !serial;
+
+        _txtIp.Enabled = !serial && idle;
+        _numPort.Enabled = !serial && idle;
+
+        _cboSerialPort.Enabled = serial && idle;
+        _btnRefreshPorts.Enabled = serial && idle;
+        _cboBaud.Enabled = serial && idle;
+        _cboDataBits.Enabled = serial && idle;
+        _cboParity.Enabled = serial && idle;
+        _cboStopBits.Enabled = serial && idle;
+        _cboHandshake.Enabled = serial && idle;
+        _chkDtr.Enabled = serial && idle;
+        _chkRts.Enabled = serial && idle;
+    }
+
+    private void RefreshSerialPorts()
+    {
+        string current = _cboSerialPort.SelectedItem as string ?? _cboSerialPort.Text;
+
+        string[] ports;
+        try
+        {
+            ports = SerialPort.GetPortNames()
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(PortNumber)
+                .ThenBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch
+        {
+            ports = Array.Empty<string>();
+        }
+
+        _cboSerialPort.Items.Clear();
+        foreach (string port in ports) _cboSerialPort.Items.Add(port);
+
+        int index = Array.FindIndex(ports, port => port.Equals(current, StringComparison.OrdinalIgnoreCase));
+        if (index < 0 && current.Length > 0)
+        {
+            _cboSerialPort.Items.Add(current); // 上次保存的串口当前未插入，仍保留选项
+            index = _cboSerialPort.Items.Count - 1;
+        }
+
+        if (_cboSerialPort.Items.Count > 0)
+            _cboSerialPort.SelectedIndex = index >= 0 ? index : 0;
+    }
+
+    private static int PortNumber(string name)
+    {
+        var digits = new string(name.Where(char.IsDigit).ToArray());
+        return int.TryParse(digits, out int number) ? number : int.MaxValue;
+    }
+
+    private SerialSettings CurrentSerialSettings()
+    {
+        return new SerialSettings
+        {
+            PortName = _cboSerialPort.SelectedItem as string ?? _cboSerialPort.Text.Trim(),
+            BaudRate = int.TryParse(_cboBaud.Text.Trim(), out int baudRate) && baudRate > 0 ? baudRate : 9600,
+            DataBits = _cboDataBits.SelectedItem is int dataBits ? dataBits : 8,
+            Parity = _cboParity.SelectedIndex switch
+            {
+                1 => System.IO.Ports.Parity.Odd,
+                2 => System.IO.Ports.Parity.Even,
+                3 => System.IO.Ports.Parity.Mark,
+                4 => System.IO.Ports.Parity.Space,
+                _ => System.IO.Ports.Parity.None
+            },
+            StopBits = _cboStopBits.SelectedIndex switch
+            {
+                1 => System.IO.Ports.StopBits.OnePointFive,
+                2 => System.IO.Ports.StopBits.Two,
+                _ => System.IO.Ports.StopBits.One
+            },
+            Handshake = _cboHandshake.SelectedIndex switch
+            {
+                1 => System.IO.Ports.Handshake.XOnXOff,
+                2 => System.IO.Ports.Handshake.RequestToSend,
+                3 => System.IO.Ports.Handshake.RequestToSendXOnXOff,
+                _ => System.IO.Ports.Handshake.None
+            },
+            DtrEnable = _chkDtr.Checked,
+            RtsEnable = _chkRts.Checked
+        };
     }
 
     private static TabPage CreateTextTab(string title, RichTextBox box)
@@ -462,12 +656,25 @@ public sealed class MainForm : Form
 
         int port = (int)_numPort.Value;
         bool listenMode = _cboMode.SelectedIndex == 0;
+        bool serialMode = IsSerialMode;
 
         string host = _txtIp.Text.Trim();
-        if (!listenMode && host.Length == 0)
+        if (!listenMode && !serialMode && host.Length == 0)
         {
             MessageBox.Show(this, "请输入仪器 IP 地址。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
+        }
+
+        SerialSettings? serialSettings = null;
+        if (serialMode)
+        {
+            serialSettings = CurrentSerialSettings();
+            if (serialSettings.PortName.Length == 0)
+            {
+                MessageBox.Show(this, "请选择串口（COM 口）。若列表为空，点“刷新”或确认 USB 转串口驱动已安装。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
         }
 
         var service = new Hl7ReceiverService { Lenient = _chkLenient.Checked };
@@ -490,7 +697,13 @@ public sealed class MainForm : Form
 
         try
         {
-            if (listenMode)
+            if (serialMode)
+            {
+                service.StartSerial(serialSettings!, _chkReconnect.Checked);
+                LogLine($"串口模式：{serialSettings!.Describe()}");
+                LogLine("请确认仪器侧串口参数与本工具完全一致（波特率、数据位、校验、停止位、流控）。");
+            }
+            else if (listenMode)
             {
                 service.StartServer(port);
                 LogLine($"监听模式：本机所有网卡的 {port} 端口已打开，请把仪器数据上报地址配成本机 IP: {port}");
@@ -517,9 +730,8 @@ public sealed class MainForm : Form
         _btnStop.Enabled = true;
         _btnSelfTest.Enabled = listenMode;
         _cboMode.Enabled = false;
-        _txtIp.Enabled = false;
-        _numPort.Enabled = false;
         _cboEncoding.Enabled = false;
+        UpdateModeUi();
         _lblRunState.Text = "运行中";
         _lblRunState.ForeColor = Color.ForestGreen;
     }
@@ -542,9 +754,8 @@ public sealed class MainForm : Form
         _btnStop.Enabled = false;
         _btnSelfTest.Enabled = false;
         _cboMode.Enabled = true;
-        _txtIp.Enabled = true;
-        _numPort.Enabled = true;
         _cboEncoding.Enabled = true;
+        UpdateModeUi();
         _lblRunState.Text = "已停止";
         _lblRunState.ForeColor = Color.Gray;
         AppendLog("已停止接收。");
@@ -793,7 +1004,9 @@ public sealed class MainForm : Form
         if (_chkLenient.Checked)
             service.FlushIdle(TimeSpan.FromMilliseconds((double)_numIdleMs.Value));
 
-        _lblStatusConn.Text = $"连接: {service.ConnectionCount}";
+        _lblStatusConn.Text = service.IsSerial
+            ? $"串口: {service.SerialPortName ?? "-"}（{(service.ConnectionCount > 0 ? "已打开" : "已断开")}）"
+            : $"连接: {service.ConnectionCount}";
         _lblStatusMsg.Text = $"消息: {_messageCount}";
         _lblStatusBytes.Text = $"累计字节: {service.TotalBytesReceived:N0}";
         _lblStatusBuf.Text = $"缓存: {service.PendingBufferBytes:N0} B";
@@ -891,6 +1104,8 @@ public sealed class MainForm : Form
 
     private void LoadSettings()
     {
+        RefreshSerialPorts();
+
         try
         {
             AppSettings settings;
@@ -899,7 +1114,7 @@ public sealed class MainForm : Form
             else
                 settings = new AppSettings();
 
-            _cboMode.SelectedIndex = settings.Mode is >= 0 and <= 1 ? settings.Mode : 1;
+            _cboMode.SelectedIndex = settings.Mode is >= 0 and <= 2 ? settings.Mode : 1;
             _txtIp.Text = string.IsNullOrWhiteSpace(settings.Ip) ? "192.168.26.111" : settings.Ip;
             _numPort.Value = Math.Clamp(settings.Port, 1, 65535);
             _cboEncoding.SelectedIndex = settings.EncodingIndex is >= 0 and <= 3 ? settings.EncodingIndex : 0;
@@ -911,6 +1126,25 @@ public sealed class MainForm : Form
             _chkChunkLog.Checked = settings.ChunkLog;
             _chkAutoSelect.Checked = settings.AutoSelect;
             _chkReconnect.Checked = settings.AutoReconnect;
+
+            _cboBaud.Text = settings.BaudRate > 0 ? settings.BaudRate.ToString() : "9600";
+            _cboDataBits.SelectedIndex = Math.Clamp(settings.DataBits - 5, 0, 3);
+            _cboParity.SelectedIndex = Math.Clamp(settings.ParityIndex, 0, 4);
+            _cboStopBits.SelectedIndex = Math.Clamp(settings.StopBitsIndex, 0, 2);
+            _cboHandshake.SelectedIndex = Math.Clamp(settings.HandshakeIndex, 0, 3);
+            _chkDtr.Checked = settings.DtrEnable;
+            _chkRts.Checked = settings.RtsEnable;
+
+            if (!string.IsNullOrWhiteSpace(settings.SerialPort))
+            {
+                int index = _cboSerialPort.Items.IndexOf(settings.SerialPort);
+                if (index < 0)
+                {
+                    _cboSerialPort.Items.Add(settings.SerialPort);
+                    index = _cboSerialPort.Items.Count - 1;
+                }
+                _cboSerialPort.SelectedIndex = index;
+            }
         }
         catch
         {
@@ -921,7 +1155,16 @@ public sealed class MainForm : Form
             _chkChunkLog.Checked = true;
             _chkAutoSelect.Checked = true;
             _chkReconnect.Checked = true;
+            _cboBaud.Text = "9600";
+            _cboDataBits.SelectedIndex = 3;
+            _cboParity.SelectedIndex = 0;
+            _cboStopBits.SelectedIndex = 0;
+            _cboHandshake.SelectedIndex = 0;
+            _chkDtr.Checked = true;
+            _chkRts.Checked = true;
         }
+
+        UpdateModeUi();
 
         _encoding = SelectedEncoding();
         _autoAck = _chkAutoAck.Checked;
@@ -946,7 +1189,15 @@ public sealed class MainForm : Form
                 IdleMs = (int)_numIdleMs.Value,
                 ChunkLog = _chkChunkLog.Checked,
                 AutoSelect = _chkAutoSelect.Checked,
-                AutoReconnect = _chkReconnect.Checked
+                AutoReconnect = _chkReconnect.Checked,
+                SerialPort = _cboSerialPort.SelectedItem as string ?? _cboSerialPort.Text.Trim(),
+                BaudRate = int.TryParse(_cboBaud.Text.Trim(), out int baudRate) ? baudRate : 9600,
+                DataBits = _cboDataBits.SelectedItem is int dataBits ? dataBits : 8,
+                ParityIndex = _cboParity.SelectedIndex,
+                StopBitsIndex = _cboStopBits.SelectedIndex,
+                HandshakeIndex = _cboHandshake.SelectedIndex,
+                DtrEnable = _chkDtr.Checked,
+                RtsEnable = _chkRts.Checked
             };
 
             File.WriteAllText(_settingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
@@ -968,5 +1219,13 @@ public sealed class MainForm : Form
         public bool ChunkLog { get; set; } = true;
         public bool AutoSelect { get; set; } = true;
         public bool AutoReconnect { get; set; } = true;
+        public string SerialPort { get; set; } = "";
+        public int BaudRate { get; set; } = 9600;
+        public int DataBits { get; set; } = 8;
+        public int ParityIndex { get; set; }
+        public int StopBitsIndex { get; set; }
+        public int HandshakeIndex { get; set; }
+        public bool DtrEnable { get; set; } = true;
+        public bool RtsEnable { get; set; } = true;
     }
 }
